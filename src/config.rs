@@ -43,7 +43,10 @@ pub fn data_dir() -> PathBuf {
             .unwrap_or_else(|| home().join("AppData").join("Local"));
         base.join("Agentmetry")
     } else if cfg!(target_os = "macos") {
-        home().join("Library").join("Application Support").join("Agentmetry")
+        home()
+            .join("Library")
+            .join("Application Support")
+            .join("Agentmetry")
     } else {
         let base = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
@@ -65,15 +68,12 @@ fn read_token_file(path: &PathBuf) -> String {
         .unwrap_or_default()
 }
 
-/// Path of the managed config file: `<data dir>/guard.json`, overridable for
-/// tests and fleet tooling.
-pub fn guard_config_path(data_dir: &std::path::Path) -> PathBuf {
-    if let Some(p) = std::env::var_os("AGENTMETRY_GUARD_CONFIG") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
+/// A missing default is optional. A path selected by the operator is required.
+pub fn guard_config_path(data_dir: &std::path::Path) -> (PathBuf, bool) {
+    match std::env::var_os("AGENTMETRY_GUARD_CONFIG") {
+        Some(path) => (PathBuf::from(path), true),
+        None => (data_dir.join("guard.json"), false),
     }
-    data_dir.join("guard.json")
 }
 
 pub fn load() -> Config {

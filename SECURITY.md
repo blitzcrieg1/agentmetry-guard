@@ -2,12 +2,11 @@
 
 ## Status: Experimental
 
-agentmetry-guard is a phase-1 spike. The loopback proxy and the `wrap`
-subcommand are smoke-tested in CI on Linux, macOS and Windows, but the
-Seatbelt (macOS) and Bubblewrap (Linux) sandbox paths have not yet been
-exercised against a live agent session, and there are no release binaries.
-Do not rely on it as a containment boundary yet. It is a visibility layer;
-see the README for what the proxy can and cannot see.
+Guard is an experimental visibility layer. The loopback proxy observes
+cooperating clients. Windows uses proxy environment variables only. Seatbelt
+and Bubblewrap can hide selected home credential paths while leaving the
+network stack available. The requested launch mode is not evidence that a
+real agent session was contained. See [the README](README.md) for coverage.
 
 ## Reporting a vulnerability
 
@@ -24,20 +23,16 @@ project we cannot offer a bounty.
 
 In scope:
 
-- Proxy bypasses that are not documented as limitations in the README
-  (a cooperative-client bypass is a known limitation, not a bug).
+- A client that follows proxy configuration reaching an unexpected destination.
 - Sandbox escapes: a wrapped child reading `~/.ssh`, `~/.aws`, `~/.gnupg`,
   `~/.kube`, `~/.docker`, `~/.azure`, `~/.gcloud`, `~/.netrc`,
   `~/.git-credentials`, `~/.npmrc`, `~/.pypirc` under Seatbelt or Bubblewrap.
 - Anything in the event path that leaks a secret into the JSONL file or the
   ingest POST.
-- Denylist/allowlist evasion (e.g. a `CONNECT` authority form, trailing dot,
-  or case variant that dodges matching; both sides are normalized, but a
-  novel form is exactly what a report is for).
+- An unintended destination being permitted by an active proxy policy.
+- Startup proceeding with an invalid or unreadable configured policy.
 
 Out of scope:
 
-- A non-cooperative client ignoring the proxy env vars and connecting
-  directly. That is the documented reason the sandbox layer exists.
-- DNS exfiltration. The proxy never sees DNS unless the client is configured
-  to route it through the proxy.
+- Direct connections by clients that ignore the proxy environment.
+- DNS traffic outside the proxy.

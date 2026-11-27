@@ -16,12 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --release
-      - run: cargo clippy --release -- -D warnings
-      - run: cargo build --release
-      # Live wrap test: forwards one HTTP request through the proxy and
-      # refuses one denylisted CONNECT, on every OS (env-only on Windows,
-      # Seatbelt on macOS, bwrap on ubuntu with bubblewrap installed).
-      - run: sudo apt-get install -y bubblewrap
-        if: runner.os == 'Linux'
-      - run: bash scripts/smoke.sh ./target/release/agentmetry-guard
+      - run: cargo test --offline --locked --release
+      - run: cargo clippy --offline --locked --release -- -D warnings
+      - run: cargo build --offline --locked --release
+      - name: Smoke test the built binary on loopback
+        shell: bash
+        run: bash scripts/smoke.sh ./target/release/agentmetry-guard

@@ -35,8 +35,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - run: cargo test --release --target ${{ matrix.target }}
-      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cargo test --offline --locked --release --target ${{ matrix.target }}
+      - run: cargo build --offline --locked --release --target ${{ matrix.target }}
+      - name: Smoke test the release binary on loopback
+        shell: bash
+        run: bash scripts/smoke.sh "target/${{ matrix.target }}/release/agentmetry-guard"
       - name: Stage binary
         shell: bash
         run: |
