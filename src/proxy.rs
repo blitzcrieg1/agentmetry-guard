@@ -79,18 +79,8 @@ fn denied(host: &str, denylist: &[String]) -> bool {
     })
 }
 
-fn emit(emitter: &Emitter, corr: &str, sess: &str, outcome: &str, scheme: &str, method: &str, host: &str, port: u16, path: &str) {
-    emitter.emit(&EgressEvent {
-        correlation_id: corr,
-        session_id: sess,
-        timestamp_utc: &now_utc_iso(),
-        outcome,
-        scheme,
-        method,
-        host,
-        port,
-        path,
-    });
+fn emit(emitter: &Emitter, ev: &EgressEvent) {
+    emitter.emit(ev);
 }
 
 /// Read the request head (up to \r\n\r\n), capped, with a short timeout so an
@@ -124,12 +114,13 @@ fn handle_connection(mut client: TcpStream, emitter: Arc<Emitter>, denylist: Vec
     if let Some(rest) = first_line.strip_prefix("CONNECT ") {
         let authority = rest.split_whitespace().next().unwrap_or("").trim();
         let (host, port) = split_authority(authority, 443);
+        let ts = now_utc_iso();
         if denied(&host, &denylist) {
-            emit(&emitter, &corr, &sess, "denied", "https", "CONNECT", &host, port, "");
+            emit(&emitter, &EgressEvent { correlation_id: &corr, session_id: &sess, timestamp_utc: &ts, outcome: "denied", scheme: "https", method: "CONNECT", host: &host, port, path: "" });
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
             return Ok(());
         }
-        emit(&emitter, &corr, &sess, "success", "https", "CONNECT", &host, port, "");
+        emit(&emitter, &EgressEvent { correlation_id: &corr, session_id: &sess, timestamp_utc: &ts, outcome: "success", scheme: "https", method: "CONNECT", host: &host, port, path: "" });
         return tunnel(client, &host, port, head);
     }
 
@@ -144,12 +135,13 @@ fn handle_connection(mut client: TcpStream, emitter: Arc<Emitter>, denylist: Vec
     if host.is_empty() {
         return Ok(());
     }
+    let ts = now_utc_iso();
     if denied(&host, &denylist) {
-        emit(&emitter, &corr, &sess, "denied", "http", &method, &host, port, &path);
+        emit(&emitter, &EgressEvent { correlation_id: &corr, session_id: &sess, timestamp_utc: &ts, outcome: "denied", scheme: "http", method: &method, host: &host, port, path: &path });
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
         return Ok(());
     }
-    emit(&emitter, &corr, &sess, "success", "http", &method, &host, port, &path);
+    emit(&emitter, &EgressEvent { correlation_id: &corr, session_id: &sess, timestamp_utc: &ts, outcome: "success", scheme: "http", method: &method, host: &host, port, path: &path });
     tunnel(client, &host, port, head)
 }
 

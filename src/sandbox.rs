@@ -104,7 +104,7 @@ pub fn wrap_command(kind: SandboxKind, program: &str, args: &[String]) -> (Strin
             argv.push("--".to_string());
             argv.push(program.to_string());
             argv.extend(args.iter().cloned());
-            return ("bwrap".to_string(), argv[1..].to_vec());
+            ("bwrap".to_string(), argv[1..].to_vec())
         }
         SandboxKind::None => (program.to_string(), args.to_vec()),
     }

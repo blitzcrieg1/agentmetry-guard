@@ -98,10 +98,10 @@ impl Emitter {
         if resp.starts_with("HTTP/1.1 2") || resp.starts_with("HTTP/1.0 2") {
             Ok(())
         } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("ingest returned: {}", resp.lines().next().unwrap_or("")),
-            ))
+            Err(std::io::Error::other(format!(
+                "ingest returned: {}",
+                resp.lines().next().unwrap_or("")
+            )))
         }
     }
 }
