@@ -71,9 +71,16 @@ impl Emitter {
         let rest = url.strip_prefix("http://").unwrap_or(url);
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, "/"),
+            None => (rest, ""),
         };
-        let path = format!("{}/audit/ingest", path.trim_end_matches('/'));
+        // The recorder mounts the audit router under /api/v1; the hook builds
+        // `{base}/api/v1/audit/ingest` from AGENTMETRY_URL, so a base URL here
+        // means the same thing.
+        let path = if path.is_empty() {
+            "/api/v1/audit/ingest".to_string()
+        } else {
+            format!("{}/audit/ingest", path.trim_end_matches('/'))
+        };
         let mut stream = TcpStream::connect_timeout(
             &authority
                 .parse()
