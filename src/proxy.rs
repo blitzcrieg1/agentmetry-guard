@@ -72,9 +72,12 @@ impl Drop for Proxy {
 }
 
 fn denied(host: &str, denylist: &[String]) -> bool {
-    let host = host.to_ascii_lowercase();
+    // Strip one trailing dot on both sides: "evil.com." and "evil.com" are
+    // the same DNS name, and a denylist that misses the dotted form is an
+    // evasion, not a distinction.
+    let host = host.to_ascii_lowercase().trim_end_matches('.').to_string();
     denylist.iter().any(|d| {
-        let d = d.to_ascii_lowercase();
+        let d = d.to_ascii_lowercase().trim_end_matches('.').to_string();
         host == d || host.ends_with(&format!(".{}", d))
     })
 }
@@ -225,4 +228,65 @@ fn tunnel(client: TcpStream, host: &str, port: u16, buffered: Vec<u8>) -> std::i
     let _ = client_write.shutdown(std::net::Shutdown::Write);
     let _ = t.join();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authority_with_port() {
+        assert_eq!(split_authority("example.com:443", 443), ("example.com".to_string(), 443));
+        assert_eq!(split_authority("example.com", 443), ("example.com".to_string(), 443));
+        assert_eq!(split_authority("example.com:8080", 443), ("example.com".to_string(), 8080));
+    }
+
+    #[test]
+    fn authority_with_userinfo_and_ipv6() {
+        assert_eq!(split_authority("user:pw@example.com:443", 443), ("example.com".to_string(), 443));
+        assert_eq!(split_authority("[::1]:8443", 443), ("::1".to_string(), 8443));
+        assert_eq!(split_authority("[2001:db8::1]", 443), ("2001:db8::1".to_string(), 443));
+    }
+
+    #[test]
+    fn trailing_dot_does_not_evade_the_denylist() {
+        // "evil.com." is the same DNS name as "evil.com"; the denylist must
+        // still match, or the dotted form is a trivial bypass.
+        let (host, _) = split_authority("evil.com.:443", 443);
+        assert_eq!(host, "evil.com.");
+        assert!(denied(&host, &["evil.com".to_string()]));
+        assert!(denied("evil.com", &["evil.com.".to_string()]));
+    }
+
+    #[test]
+    fn deny_matches_exact_and_subdomain_only() {
+        let list = vec!["evil.example.com".to_string(), "10.9.9.9".to_string()];
+        assert!(denied("evil.example.com", &list));
+        assert!(denied("api.evil.example.com", &list)); // suffix match
+        assert!(denied("10.9.9.9", &list));
+        assert!(!denied("notevil.example.com", &list)); // no partial-suffix match
+        assert!(!denied("example.com", &list));
+        assert!(!denied("10.9.9.90", &list));
+        assert!(denied("EVIL.EXAMPLE.COM", &list)); // case-insensitive
+    }
+
+    #[test]
+    fn http_target_absolute_uri() {
+        let (host, port, path) = parse_http_target("http://example.com:8080/a/b?x=1", "");
+        assert_eq!((host.as_str(), port, path.as_str()), ("example.com", 8080, "/a/b?x=1"));
+    }
+
+    #[test]
+    fn http_target_origin_form_uses_host_header() {
+        let head = "GET /x HTTP/1.1\r\nHost: api.example.com:9000\r\n\r\n";
+        let (host, port, path) = parse_http_target("/x", head);
+        assert_eq!((host.as_str(), port, path.as_str()), ("api.example.com", 9000, "/x"));
+    }
+
+    #[test]
+    fn http_target_bare_host_header_defaults_80() {
+        let head = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let (host, port, _) = parse_http_target("/", head);
+        assert_eq!((host.as_str(), port), ("example.com", 80));
+    }
 }

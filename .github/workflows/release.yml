@@ -1,0 +1,74 @@
+name: release
+
+# On a v* tag: build release binaries per OS/arch, attach them to the GitHub
+# release, and print the install one-liner. The crate is zero-dependency
+# std-only, so a native build per runner is the whole build.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: agentmetry-guard-linux-x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: agentmetry-guard-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: agentmetry-guard-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: agentmetry-guard-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo test --release --target ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [[ "${{ matrix.artifact }}" == *.exe ]]; then
+            cp "target/${{ matrix.target }}/release/agentmetry-guard.exe" "dist/${{ matrix.artifact }}"
+          else
+            cp "target/${{ matrix.target }}/release/agentmetry-guard" "dist/${{ matrix.artifact }}"
+          fi
+          chmod +x "dist/${{ matrix.artifact }}" || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: agentmetry-guard-*
+          merge-multiple: true
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          gh release create "$TAG" dist/* \
+            --title "agentmetry-guard v$VERSION" \
+            --notes "Experimental phase-1 sidecar for Agentmetry. See SECURITY.md before relying on it. Install: download the binary for your OS, or \`cargo install --git https://github.com/blitzcrieg1/agentmetry-guard --tag $TAG\`."

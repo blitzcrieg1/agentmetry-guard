@@ -31,6 +31,15 @@ so startup cost (~1 ms) and supply-chain surface are part of the product.
   says so on stderr (`sandbox mode: env-only`).
 - No root, no sudo, no eBPF, no kernel module.
 
+## Install
+
+Download a binary from [Releases](https://github.com/blitzcrieg1/agentmetry-guard/releases)
+(linux/macOS/Windows, x86_64 and Apple Silicon), or build from source:
+
+```
+cargo install --git https://github.com/blitzcrieg1/agentmetry-guard
+```
+
 ## Usage
 
 ```
