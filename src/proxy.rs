@@ -14,6 +14,7 @@
 use crate::emit::Emitter;
 use crate::json::EgressEvent;
 use crate::policy::Policy;
+use crate::ssrf::Guard;
 use crate::timeutil::now_utc_iso;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -28,9 +29,11 @@ pub struct Proxy {
 
 impl Proxy {
     /// Bind an ephemeral loopback port and start accepting.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         emitter: Arc<Emitter>,
         policy: Policy,
+        guard: Guard,
         correlation_id: String,
         session_id: String,
     ) -> std::io::Result<Proxy> {
@@ -48,7 +51,8 @@ impl Proxy {
                         let corr = correlation_id.clone();
                         let sess = session_id.clone();
                         std::thread::spawn(move || {
-                            let _ = handle_connection(stream, emitter, policy, corr, sess);
+                            let _ =
+                                handle_connection(stream, emitter, policy, guard, corr, sess);
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -112,6 +116,7 @@ fn handle_connection(
     mut client: TcpStream,
     emitter: Arc<Emitter>,
     policy: Policy,
+    guard: Guard,
     corr: String,
     sess: String,
 ) -> std::io::Result<()> {
@@ -176,6 +181,17 @@ fn handle_connection(
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no address"))?;
+    // Post-resolution guardrail: the verdict above matched the name the
+    // client asked for; this matches the address the proxy would dial, so
+    // alternate IP encodings and DNS rebinding cannot slip a metadata or
+    // private endpoint past the lists.
+    if guard.denies(addr) {
+        evidence.policy = Some("ssrf-guard");
+        evidence.outcome = "denied";
+        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+        emitter.emit(&evidence);
+        return Ok(());
+    }
     let upstream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).and_then(|mut stream| {
         stream.write_all(initial_bytes)?;
         Ok(stream)
@@ -296,6 +312,17 @@ mod tests {
         std::thread::JoinHandle<std::io::Result<()>>,
         EventFile,
     ) {
+        serve_one_with_guard(policy, Guard::default())
+    }
+
+    fn serve_one_with_guard(
+        policy: Policy,
+        guard: Guard,
+    ) -> (
+        TcpStream,
+        std::thread::JoinHandle<std::io::Result<()>>,
+        EventFile,
+    ) {
         static NEXT_FILE: AtomicUsize = AtomicUsize::new(0);
         let events = EventFile(std::env::temp_dir().join(format!(
             "agentmetry-guard-proxy-test-{}-{}.jsonl",
@@ -321,6 +348,7 @@ mod tests {
                 accepted,
                 emitter,
                 policy,
+                guard,
                 "test-corr".into(),
                 "test-session".into(),
             )
@@ -504,5 +532,100 @@ mod tests {
         assert!(!event.contains("\"path\":"));
         assert!(!event.contains("private-path"));
         assert!(!event.contains("synthetic-test-value"));
+    }
+
+    #[test]
+    fn metadata_ip_is_denied_by_default() {
+        let (mut client, proxy, events) = serve_one(Policy::default());
+        write!(
+            client,
+            "CONNECT 169.254.169.254:80 HTTP/1.1\r\nHost: 169.254.169.254:80\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 "));
+        proxy.join().unwrap().unwrap();
+        let event = std::fs::read_to_string(&events.0).unwrap();
+        assert!(event.contains("\"outcome\":\"denied\""));
+        assert!(event.contains("\"policy\":\"ssrf-guard\""));
+        assert!(event.contains("\"host\":\"169.254.169.254\""));
+    }
+
+    #[test]
+    fn allowlisting_a_name_cannot_reach_the_metadata_endpoint() {
+        // The guardrail is not a list entry: it cannot be voted away.
+        let policy = Policy {
+            deny: Vec::new(),
+            allow: vec!["169.254.169.254".to_string()],
+        };
+        let (mut client, proxy, events) = serve_one_with_guard(policy, Guard::default());
+        write!(
+            client,
+            "CONNECT 169.254.169.254:80 HTTP/1.1\r\nHost: 169.254.169.254:80\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 "));
+        proxy.join().unwrap().unwrap();
+        let event = std::fs::read_to_string(&events.0).unwrap();
+        assert!(event.contains("\"policy\":\"ssrf-guard\""));
+    }
+
+    #[test]
+    fn strict_denies_private_and_loopback_after_resolution() {
+        for host in ["10.0.0.1", "192.168.1.1", "127.0.0.1"] {
+            let (mut client, proxy, _events) =
+                serve_one_with_guard(Policy::default(), Guard::Strict);
+            write!(client, "CONNECT {host}:80 HTTP/1.1\r\nHost: {host}:80\r\n\r\n").unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 403 "),
+                "strict mode must deny {host}"
+            );
+            proxy.join().unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn guard_off_leaves_the_lists_as_the_whole_policy() {
+        // A refused loopback port: no guardrail, no list entry, so the proxy
+        // dials and answers 502 instead of denying.
+        let gone = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = gone.local_addr().unwrap().port();
+        drop(gone);
+        let (mut client, proxy, _events) = serve_one_with_guard(Policy::default(), Guard::Off);
+        write!(
+            client,
+            "CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 502 "));
+        // The dial failure propagates; the client still got its 502.
+        assert!(proxy.join().unwrap().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn alternate_ip_encodings_land_on_the_same_decision() {
+        // glibc's resolver accepts inet_aton forms: the 32-bit integer
+        // 2852039166 is 169.254.169.254. The post-DNS check must catch it
+        // even though the name never literally says "169.254".
+        let (mut client, proxy, events) = serve_one(Policy::default());
+        write!(
+            client,
+            "CONNECT 2852039166:80 HTTP/1.1\r\nHost: 2852039166:80\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 "));
+        proxy.join().unwrap().unwrap();
+        let event = std::fs::read_to_string(&events.0).unwrap();
+        assert!(event.contains("\"policy\":\"ssrf-guard\""));
     }
 }
