@@ -13,6 +13,7 @@
 
 use crate::emit::Emitter;
 use crate::json::EgressEvent;
+use crate::policy::Policy;
 use crate::timeutil::now_utc_iso;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -27,7 +28,7 @@ pub struct Proxy {
 
 impl Proxy {
     /// Bind an ephemeral loopback port and start accepting.
-    pub fn start(emitter: Arc<Emitter>, denylist: Vec<String>, correlation_id: String, session_id: String) -> std::io::Result<Proxy> {
+    pub fn start(emitter: Arc<Emitter>, policy: Policy, correlation_id: String, session_id: String) -> std::io::Result<Proxy> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -40,11 +41,11 @@ impl Proxy {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let emitter = Arc::clone(&emitter);
-                        let denylist = denylist.clone();
+                        let policy = policy.clone();
                         let corr = correlation_id.clone();
                         let sess = session_id.clone();
                         std::thread::spawn(move || {
-                            let _ = handle_connection(stream, emitter, denylist, corr, sess);
+                            let _ = handle_connection(stream, emitter, policy, corr, sess);
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -71,17 +72,6 @@ impl Drop for Proxy {
     }
 }
 
-fn denied(host: &str, denylist: &[String]) -> bool {
-    // Strip one trailing dot on both sides: "evil.com." and "evil.com" are
-    // the same DNS name, and a denylist that misses the dotted form is an
-    // evasion, not a distinction.
-    let host = host.to_ascii_lowercase().trim_end_matches('.').to_string();
-    denylist.iter().any(|d| {
-        let d = d.to_ascii_lowercase().trim_end_matches('.').to_string();
-        host == d || host.ends_with(&format!(".{}", d))
-    })
-}
-
 fn emit(emitter: &Emitter, ev: &EgressEvent) {
     emitter.emit(ev);
 }
@@ -106,7 +96,7 @@ fn read_head(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn handle_connection(mut client: TcpStream, emitter: Arc<Emitter>, denylist: Vec<String>, corr: String, sess: String) -> std::io::Result<()> {
+fn handle_connection(mut client: TcpStream, emitter: Arc<Emitter>, policy: Policy, corr: String, sess: String) -> std::io::Result<()> {
     let head = match read_head(&mut client) {
         Ok(h) => h,
         Err(_) => return Ok(()), // client went away before sending anything
@@ -118,12 +108,12 @@ fn handle_connection(mut client: TcpStream, emitter: Arc<Emitter>, denylist: Vec
         let authority = rest.split_whitespace().next().unwrap_or("").trim();
         let (host, port) = split_authority(authority, 443);
         let ts = now_utc_iso();
-        if denied(&host, &denylist) {
-            emit(&emitter, &EgressEvent { correlation_id: &corr, session_id: &sess, timestamp_utc: &ts, outcome: "denied", scheme: "https", method: "CONNECT", host: &host, port, path: "" });
+        if let Some(rule) = policy.verdict(&host) {
+            emit(&emitter, &EgressEvent { correlation_id: &corr, session_id: &sess, timestamp_utc: &ts, outcome: "denied", scheme: "https", method: "CONNECT", host: &host, port, path: "", policy: Some(rule) });
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
             return Ok(());
         }
-        emit(&emitter, &EgressEvent { correlation_id: &corr, session_id: &sess, timestamp_utc: &ts, outcome: "success", scheme: "https", method: "CONNECT", host: &host, port, path: "" });
+        emit(&emitter, &EgressEvent { correlation_id: &corr, session_id: &sess, timestamp_utc: &ts, outcome: "success", scheme: "https", method: "CONNECT", host: &host, port, path: "", policy: None });
         return tunnel(client, &host, port, head);
     }
 
@@ -139,12 +129,12 @@ fn handle_connection(mut client: TcpStream, emitter: Arc<Emitter>, denylist: Vec
         return Ok(());
     }
     let ts = now_utc_iso();
-    if denied(&host, &denylist) {
-        emit(&emitter, &EgressEvent { correlation_id: &corr, session_id: &sess, timestamp_utc: &ts, outcome: "denied", scheme: "http", method: &method, host: &host, port, path: &path });
+    if let Some(rule) = policy.verdict(&host) {
+        emit(&emitter, &EgressEvent { correlation_id: &corr, session_id: &sess, timestamp_utc: &ts, outcome: "denied", scheme: "http", method: &method, host: &host, port, path: &path, policy: Some(rule) });
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
         return Ok(());
     }
-    emit(&emitter, &EgressEvent { correlation_id: &corr, session_id: &sess, timestamp_utc: &ts, outcome: "success", scheme: "http", method: &method, host: &host, port, path: &path });
+    emit(&emitter, &EgressEvent { correlation_id: &corr, session_id: &sess, timestamp_utc: &ts, outcome: "success", scheme: "http", method: &method, host: &host, port, path: &path, policy: None });
     tunnel(client, &host, port, head)
 }
 
@@ -246,28 +236,6 @@ mod tests {
         assert_eq!(split_authority("user:pw@example.com:443", 443), ("example.com".to_string(), 443));
         assert_eq!(split_authority("[::1]:8443", 443), ("::1".to_string(), 8443));
         assert_eq!(split_authority("[2001:db8::1]", 443), ("2001:db8::1".to_string(), 443));
-    }
-
-    #[test]
-    fn trailing_dot_does_not_evade_the_denylist() {
-        // "evil.com." is the same DNS name as "evil.com"; the denylist must
-        // still match, or the dotted form is a trivial bypass.
-        let (host, _) = split_authority("evil.com.:443", 443);
-        assert_eq!(host, "evil.com.");
-        assert!(denied(&host, &["evil.com".to_string()]));
-        assert!(denied("evil.com", &["evil.com.".to_string()]));
-    }
-
-    #[test]
-    fn deny_matches_exact_and_subdomain_only() {
-        let list = vec!["evil.example.com".to_string(), "10.9.9.9".to_string()];
-        assert!(denied("evil.example.com", &list));
-        assert!(denied("api.evil.example.com", &list)); // suffix match
-        assert!(denied("10.9.9.9", &list));
-        assert!(!denied("notevil.example.com", &list)); // no partial-suffix match
-        assert!(!denied("example.com", &list));
-        assert!(!denied("10.9.9.90", &list));
-        assert!(denied("EVIL.EXAMPLE.COM", &list)); // case-insensitive
     }
 
     #[test]

@@ -36,6 +36,7 @@ pub struct EgressEvent<'a> {
     pub host: &'a str,
     pub port: u16,
     pub path: &'a str, // request target for plain HTTP; "" for CONNECT
+    pub policy: Option<&'a str>, // Some("denylist"|"allowlist") when blocked
 }
 
 impl<'a> EgressEvent<'a> {
@@ -62,12 +63,16 @@ impl<'a> EgressEvent<'a> {
         s.push_str("\"tool\":{\"qualified\":\"guard.egress\",\"server\":\"guard\",");
         s.push_str(&format!("\"command\":{},", quote(&command)));
         s.push_str(&format!(
-            "\"arguments\":{{\"scheme\":{},\"method\":{},\"host\":{},\"port\":{},\"path\":{}}}}}",
+            "\"arguments\":{{\"scheme\":{},\"method\":{},\"host\":{},\"port\":{},\"path\":{},\"policy\":{}}}}}",
             quote(self.scheme),
             quote(self.method),
             quote(self.host),
             self.port,
-            quote(self.path)
+            quote(self.path),
+            match self.policy {
+                Some(p) => quote(p),
+                None => "null".to_string(),
+            }
         ));
         s.push('}');
         s
@@ -95,12 +100,14 @@ mod tests {
             host: "evil.example.com",
             port: 443,
             path: "",
+            policy: Some("denylist"),
         };
         let j = ev.to_json();
         assert!(j.contains("\"event_type\":\"network_egress\""));
         assert!(j.contains("\"adapter\":\"guard\""));
         assert!(j.contains("\"command\":\"CONNECT evil.example.com:443\""));
         assert!(j.contains("\"port\":443"));
+        assert!(j.contains("\"policy\":\"denylist\""));
         // Must parse as JSON: round-trip through a tiny check that braces balance.
         assert_eq!(j.matches('{').count(), j.matches('}').count());
     }

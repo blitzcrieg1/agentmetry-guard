@@ -31,8 +31,9 @@ In scope:
   `~/.git-credentials`, `~/.npmrc`, `~/.pypirc` under Seatbelt or Bubblewrap.
 - Anything in the event path that leaks a secret into the JSONL file or the
   ingest POST.
-- Denylist evasion (e.g. a `CONNECT` authority form that dodges suffix
-  matching).
+- Denylist/allowlist evasion (e.g. a `CONNECT` authority form, trailing dot,
+  or case variant that dodges matching; both sides are normalized, but a
+  novel form is exactly what a report is for).
 
 Out of scope:
 

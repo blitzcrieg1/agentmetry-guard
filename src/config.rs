@@ -65,6 +65,17 @@ fn read_token_file(path: &PathBuf) -> String {
         .unwrap_or_default()
 }
 
+/// Path of the managed config file: `<data dir>/guard.json`, overridable for
+/// tests and fleet tooling.
+pub fn guard_config_path(data_dir: &std::path::Path) -> PathBuf {
+    if let Some(p) = std::env::var_os("AGENTMETRY_GUARD_CONFIG") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    data_dir.join("guard.json")
+}
+
 pub fn load() -> Config {
     let data_dir = data_dir();
     let api_key = {

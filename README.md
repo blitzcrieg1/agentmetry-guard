@@ -80,11 +80,31 @@ and `source.adapter = "guard"`. They join the agent session by
 forwarders, but they are not `tool_called`, so the tool-sequence detection
 rules do not count them.
 
-## Denylist
+## Host policy: denylist and allowlist
 
-`--deny evil.example.com,10.0.0.0/8`-style entries (host or domain suffix,
-comma-separated) make the proxy answer `403` to matching `CONNECT` or HTTP
-requests and record the attempt with `outcome: "denied"`.
+`--deny evil.example.com,10.9.9.9` (host or domain suffix, comma-separated,
+case-insensitive, trailing dot normalized) makes the proxy answer `403` to
+matching requests. `--allow api.example.com` switches to allowlist mode: a
+non-empty allowlist blocks every host that does not match it. Blocked
+requests are recorded with `outcome: "denied"` and `policy: "denylist"` or
+`"allowlist"` in `tool.arguments`, so the trail says which list decided.
+
+Precedence per list: CLI flag > environment (`AGENTMETRY_GUARD_DENY` /
+`AGENTMETRY_GUARD_ALLOW`) > the config file.
+
+## Config file
+
+`<data dir>/guard.json` (override with `AGENTMETRY_GUARD_CONFIG`) is the
+managed config, written by fleet tooling:
+
+```json
+{"deny": ["blocked.invalid"], "allow": ["api.example.com"], "events_file": "/var/log/guard-events.jsonl"}
+```
+
+The file is parsed strictly: unknown keys or malformed JSON are rejected, so
+a corrupt file never silently becomes "allow all". `events_file` sets the
+default JSONL path (`--events-file` and `AGENTMETRY_GUARD_EVENTS_FILE` win
+over it).
 
 ## Status
 

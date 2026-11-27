@@ -56,12 +56,24 @@ EVENTS="$WORK/guard-events.jsonl"
 "$BIN" wrap --events-file "$EVENTS" --deny blocked.invalid -- \
   curl -s -m 10 "https://blocked.invalid/" > /dev/null 2>&1 || true
 
+# 3. Allowlist mode via the config file: a non-listed host is refused with
+#    policy="allowlist", a listed one passes.
+CFG="$WORK/guard.json"
+printf '{"deny": ["blocked.invalid"], "allow": ["%s"]}' "$IP" > "$CFG"
+AGENTMETRY_GUARD_CONFIG="$CFG" "$BIN" wrap --events-file "$EVENTS" -- \
+  curl -s -m 10 "https://not-listed.invalid/" > /dev/null 2>&1 || true
+AGENTMETRY_GUARD_CONFIG="$CFG" "$BIN" wrap --events-file "$EVENTS" -- \
+  curl -s -m 10 "http://$IP:8899/" > /dev/null
+
 sleep 1
 
 grep -q "\"command\":\"GET $IP/\"" "$EVENTS" || { echo "FAIL: no GET event" >&2; cat "$EVENTS" >&2; exit 1; }
 grep -q '"outcome":"success"' "$EVENTS" || { echo "FAIL: GET not marked success" >&2; cat "$EVENTS" >&2; exit 1; }
 grep -q '"command":"CONNECT blocked.invalid:443"' "$EVENTS" || { echo "FAIL: no CONNECT event" >&2; cat "$EVENTS" >&2; exit 1; }
 grep -q '"outcome":"denied"' "$EVENTS" || { echo "FAIL: CONNECT not marked denied" >&2; cat "$EVENTS" >&2; exit 1; }
+grep -q '"policy":"denylist"' "$EVENTS" || { echo "FAIL: denylist policy missing" >&2; cat "$EVENTS" >&2; exit 1; }
+grep -q '"command":"CONNECT not-listed.invalid:443"' "$EVENTS" || { echo "FAIL: no allowlist CONNECT event" >&2; cat "$EVENTS" >&2; exit 1; }
+grep -q '"policy":"allowlist"' "$EVENTS" || { echo "FAIL: allowlist policy missing" >&2; cat "$EVENTS" >&2; exit 1; }
 grep -q '"correlation_id":"ci-smoke"' "$EVENTS" || { echo "FAIL: correlation missing" >&2; cat "$EVENTS" >&2; exit 1; }
 
 echo "smoke: OK"
