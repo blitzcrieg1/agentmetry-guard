@@ -50,11 +50,11 @@ EVENTS="$WORK/guard-events.jsonl"
 
 # 1. Plain HTTP through the proxy.
 "$BIN" wrap --events-file "$EVENTS" --deny blocked.invalid -- \
-  curl -s -m 10 -o /dev/null "http://$IP:8899/"
+  curl -s -m 10 "http://$IP:8899/" > /dev/null
 
 # 2. Denylisted HTTPS: the proxy must answer 403 and record outcome=denied.
 "$BIN" wrap --events-file "$EVENTS" --deny blocked.invalid -- \
-  curl -s -m 10 -o /dev/null "https://blocked.invalid/" || true
+  curl -s -m 10 "https://blocked.invalid/" > /dev/null 2>&1 || true
 
 sleep 1
 
