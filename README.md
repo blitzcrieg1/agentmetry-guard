@@ -1,5 +1,11 @@
 # agentmetry-guard
 
+> **Experimental.** Phase-1 spike: the proxy and `wrap` work and are
+> smoke-tested in CI on Linux, macOS and Windows, but the Seatbelt/Bubblewrap
+> sandbox paths have not been exercised against a live agent session yet, and
+> there are no release binaries. Read [SECURITY.md](SECURITY.md) before relying
+> on it for anything. Reports welcome; see "Reporting a vulnerability" there.
+
 User-space egress visibility sidecar for [Agentmetry](https://github.com/blitzcrieg1/agentmetry).
 It closes the child-process blind spot: when an AI agent runs a shell tool call
 (`./script.sh`, `python run.py`), child processes can open network connections

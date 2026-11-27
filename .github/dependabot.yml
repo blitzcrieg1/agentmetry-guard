@@ -1,0 +1,13 @@
+version: 2
+
+# Zero runtime dependencies today, so this only watches the build/dev
+# surface. Weekly, not daily: a queue nobody reads is worse than none.
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: Europe/Athens

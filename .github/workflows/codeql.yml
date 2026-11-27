@@ -1,0 +1,37 @@
+name: CodeQL
+
+# Static analysis on the Rust sidecar. Not a required status check on
+# purpose: its findings want reading, and blocking every PR on it would
+# teach the maintainer to merge past it. Runs on pushes, PRs and weekly.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: rust
+          queries: security-extended
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v4
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:rust
