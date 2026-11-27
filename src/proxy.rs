@@ -16,7 +16,7 @@ use crate::json::EgressEvent;
 use crate::policy::Policy;
 use crate::timeutil::now_utc_iso;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -158,31 +158,41 @@ fn handle_connection(
     };
     if evidence.policy.is_some() {
         evidence.outcome = "denied";
-        emitter.emit(&evidence);
+        // Reply first, emit second: the ingest POST is bounded but can still
+        // take up to ~2s against a dead endpoint, and the client must not
+        // wait on our telemetry.
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+        emitter.emit(&evidence);
         return Ok(());
     }
 
     // The CONNECT header belongs to the proxy. Only data after the header
     // goes to the origin. A plain HTTP request is forwarded as received.
     let initial_bytes = if connect { &head[head_end..] } else { &head };
-    let upstream = TcpStream::connect((host.as_str(), port)).and_then(|mut stream| {
+    // Bound the upstream dial: a host that blackholes SYNs must not wedge the
+    // client connection (seen as an 8s+ hang on macOS runners for a refused
+    // loopback port).
+    let addr = (host.as_str(), port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no address"))?;
+    let upstream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).and_then(|mut stream| {
         stream.write_all(initial_bytes)?;
         Ok(stream)
     });
     let upstream = match upstream {
         Ok(upstream) => upstream,
         Err(error) => {
-            emitter.emit(&evidence);
             let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+            emitter.emit(&evidence);
             return Err(error);
         }
     };
     evidence.outcome = "success";
-    emitter.emit(&evidence);
     if connect {
         client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
     }
+    emitter.emit(&evidence);
     tunnel(client, upstream)
 }
 
