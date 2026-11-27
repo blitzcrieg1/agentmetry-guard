@@ -19,9 +19,19 @@
 //! An empty allowlist allows everything; a non-empty one blocks all
 //! non-matching hosts (outcome=denied, policy="allowlist" in the event).
 //!
-//! Events go to `--events-file` (JSONL) and, when a token is available, are
+//! Post-resolution egress guardrails (`ssrf_guard` in guard.json, or
+//! AGENTMETRY_GUARD_SSRF) run after DNS: `metadata` (default) blocks
+//! link-local destinations such as the cloud metadata endpoints, `strict`
+//! also blocks loopback and private ranges, `off` leaves the lists as the
+//! whole policy (denials are outcome=denied, policy="ssrf-guard").
+//!
+//! The Bubblewrap wrapper binds the current directory and `/tmp` writable by
+//! default (`writable_defaults`, default true) plus any `writable_paths`,
+//! while keeping credential directories hidden. Events go to
+//! `--events-file` (JSONL, authoritative) and, when a token is available, are
 //! POSTed to Agentmetry's local ingest as source_app=agentmetry,
-//! adapter=guard.
+//! adapter=guard, from a background worker so telemetry never delays a
+//! tunnel.
 
 mod config;
 mod emit;
@@ -30,9 +40,12 @@ mod json;
 mod policy;
 mod proxy;
 mod sandbox;
+mod ssrf;
 mod timeutil;
 
 use policy::Policy;
+use sandbox::Writable;
+use ssrf::Guard;
 use std::sync::Arc;
 
 struct Options {
@@ -113,13 +126,28 @@ fn resolve_list(
 fn resolve_options(
     opts: Options,
     cfg: &config::Config,
-) -> Result<(Policy, std::path::PathBuf), String> {
+) -> Result<(Policy, Guard, Writable, std::path::PathBuf), String> {
     let (path, required) = config::guard_config_path(&cfg.data_dir);
     let file = fileconf::load(&path, required)?;
     let policy = Policy {
         deny: resolve_list(opts.deny, "AGENTMETRY_GUARD_DENY", file.deny)?,
         allow: resolve_list(opts.allow, "AGENTMETRY_GUARD_ALLOW", file.allow)?,
     };
+    // Guardrail mode: environment over file, default metadata.
+    let guard = match std::env::var("AGENTMETRY_GUARD_SSRF") {
+        Ok(value) if !value.trim().is_empty() => Guard::from_value(Some(value.trim()))?,
+        _ => Guard::from_value(file.ssrf_guard.as_deref())?,
+    };
+    let home = if cfg!(windows) {
+        std::env::var_os("USERPROFILE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+    } else {
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+    };
+    let writable = Writable::from_config(file.writable_defaults, file.writable_paths, &home);
     let events_file = opts
         .events_file
         .or_else(|| {
@@ -129,7 +157,7 @@ fn resolve_options(
         })
         .or(file.events_file)
         .unwrap_or_else(|| cfg.data_dir.join("guard-events.jsonl"));
-    Ok((policy, events_file))
+    Ok((policy, guard, writable, events_file))
 }
 
 fn main() {
@@ -137,6 +165,10 @@ fn main() {
     let code = match args.first().map(|s| s.as_str()) {
         Some("proxy") => cmd_proxy(&args[1..]),
         Some("wrap") => cmd_wrap(&args[1..]),
+        Some("--version") | Some("-V") => {
+            println!("agentmetry-guard {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
         Some("-h") | Some("--help") | None => {
             print_help();
             0
@@ -152,7 +184,7 @@ fn main() {
 
 fn print_help() {
     eprintln!(
-        "agentmetry-guard {}\n\nUSAGE:\n  agentmetry-guard proxy [--events-file PATH] [--deny hosts] [--allow hosts]\n  agentmetry-guard wrap  [--events-file PATH] [--deny hosts] [--allow hosts] -- <command...>\n\nPolicy precedence per list: CLI flag > AGENTMETRY_GUARD_DENY/ALLOW > <data dir>/guard.json\n",
+        "agentmetry {}\n\nUSAGE:\n  agentmetry-guard proxy [--events-file PATH] [--deny hosts] [--allow hosts]\n  agentmetry-guard wrap  [--events-file PATH] [--deny hosts] [--allow hosts] -- <command...>\n\nPolicy precedence per list: CLI flag > AGENTMETRY_GUARD_DENY/ALLOW > <data dir>/guard.json\nguard.json keys: deny, allow, events_file, ssrf_guard (off|metadata|strict), writable_paths, writable_defaults\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -182,7 +214,7 @@ fn cmd_proxy(args: &[String]) -> i32 {
         Err(e) => return err(&e),
     };
     let cfg = config::load();
-    let (policy, events_file) = match resolve_options(opts, &cfg) {
+    let (policy, guard, _writable, events_file) = match resolve_options(opts, &cfg) {
         Ok(options) => options,
         Err(e) => return err(&e),
     };
@@ -192,7 +224,7 @@ fn cmd_proxy(args: &[String]) -> i32 {
     };
     let corr = cfg.correlation_id.clone();
     let sess = cfg.session_id.clone();
-    match proxy::Proxy::start(emitter, policy, corr, sess) {
+    match proxy::Proxy::start(emitter, policy, guard, corr, sess) {
         Ok(p) => {
             // The port on stdout is the contract with a supervising process.
             println!("{}", p.port);
@@ -223,7 +255,7 @@ fn cmd_wrap(args: &[String]) -> i32 {
         Err(e) => return err(&e),
     };
     let cfg = config::load();
-    let (policy, events_file) = match resolve_options(opts, &cfg) {
+    let (policy, guard, writable, events_file) = match resolve_options(opts, &cfg) {
         Ok(options) => options,
         Err(e) => return err(&e),
     };
@@ -233,7 +265,7 @@ fn cmd_wrap(args: &[String]) -> i32 {
     };
     let corr = cfg.correlation_id.clone();
     let sess = cfg.session_id.clone();
-    let mut proxy = match proxy::Proxy::start(Arc::clone(&emitter), policy, corr, sess) {
+    let mut proxy = match proxy::Proxy::start(Arc::clone(&emitter), policy, guard, corr, sess) {
         Ok(p) => p,
         Err(e) => return err(&format!("cannot bind proxy: {}", e)),
     };
@@ -245,7 +277,7 @@ fn cmd_wrap(args: &[String]) -> i32 {
         ),
         ("AGENTMETRY_SESSION_ID".to_string(), cfg.session_id.clone()),
     ];
-    let code = sandbox::run_wrapped(kind, &cmd[0], &cmd[1..], proxy.port, &extra_env);
+    let code = sandbox::run_wrapped(kind, &writable, &cmd[0], &cmd[1..], proxy.port, &extra_env);
     proxy.stop();
     emitter.drain(std::time::Duration::from_millis(1500));
     match code {
