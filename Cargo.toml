@@ -1,0 +1,23 @@
+[package]
+name = "agentmetry-guard"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "User-space egress visibility sidecar for Agentmetry: local proxy + OS-native sandbox wrap for AI agent shell tool calls."
+license = "Apache-2.0"
+repository = "https://github.com/blitzcrieg1/agentmetry-guard"
+publish = false
+
+# Zero dependencies on purpose: this binary runs inside every wrapped agent
+# command, so its startup cost and its supply-chain surface are both part of
+# the product. JSON is emitted by hand (we control every field), the proxy is
+# std::net with one thread per connection, and the ingest POST is a plain
+# HTTP/1.1 request over TcpStream.
+[dependencies]
+
+[profile.release]
+opt-level = 2
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
