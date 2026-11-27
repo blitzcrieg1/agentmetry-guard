@@ -6,11 +6,14 @@
 //! - Linux: Bubblewrap with a tmpfs (or /dev/null for files) over each
 //!   sensitive path that exists.
 //! - anything else (incl. Windows): no wrapper; the proxy env injection is
-//!   the whole measure. Reported in the wrap start event so a reader of the
-//!   trail can tell which mode ran.
+//!   the whole measure. stderr reports the requested launch mode.
 
-use std::path::PathBuf;
+use std::io::{self, ErrorKind};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+const SEATBELT: &str = "/usr/bin/sandbox-exec";
+const BWRAP: &[&str] = &["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxKind {
@@ -20,19 +23,20 @@ pub enum SandboxKind {
 }
 
 pub fn detect() -> SandboxKind {
-    if cfg!(target_os = "macos") && which("sandbox-exec") {
+    if cfg!(target_os = "macos") && Path::new(SEATBELT).is_file() {
         SandboxKind::Seatbelt
-    } else if cfg!(target_os = "linux") && which("bwrap") {
+    } else if cfg!(target_os = "linux") && bwrap_path().is_some() {
         SandboxKind::Bwrap
     } else {
         SandboxKind::None
     }
 }
 
-fn which(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|p| p.join(bin).is_file()))
-        .unwrap_or(false)
+fn bwrap_path() -> Option<&'static str> {
+    BWRAP
+        .iter()
+        .copied()
+        .find(|candidate| Path::new(candidate).is_file())
 }
 
 /// Credential locations hidden when a wrapper is available. Dirs get a tmpfs
@@ -40,7 +44,14 @@ fn which(bin: &str) -> bool {
 /// read deny. `.env` is deliberately NOT listed: it is per-project, and hiding
 /// the wrong one breaks legitimate local runs.
 const SENSITIVE_DIRS: &[&str] = &[
-    ".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".gcloud", ".config/gcloud",
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    ".docker",
+    ".azure",
+    ".gcloud",
+    ".config/gcloud",
 ];
 const SENSITIVE_FILES: &[&str] = &[".netrc", ".git-credentials", ".npmrc", ".pypirc"];
 
@@ -54,29 +65,27 @@ fn home() -> PathBuf {
 /// Build the wrapper command. Returns the argv prefix that executes `program`
 /// with `args` inside the sandbox, or just [program, args...] when no wrapper
 /// is available.
-pub fn wrap_command(kind: SandboxKind, program: &str, args: &[String]) -> (String, Vec<String>) {
+fn wrap_command(
+    kind: SandboxKind,
+    program: &str,
+    args: &[String],
+) -> io::Result<(String, Vec<String>)> {
     match kind {
         SandboxKind::Seatbelt => {
-            let profile = seatbelt_profile();
-            let dir = std::env::temp_dir().join(format!("agentmetry-guard-{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&dir);
-            let profile_path = dir.join("guard.sb");
-            if std::fs::write(&profile_path, profile).is_ok() {
-                let mut argv = vec![
-                    "sandbox-exec".to_string(),
-                    "-f".to_string(),
-                    profile_path.to_string_lossy().into_owned(),
-                    "--".to_string(),
-                    program.to_string(),
-                ];
-                argv.extend(args.iter().cloned());
-                return ("sandbox-exec".to_string(), argv[1..].to_vec());
-            }
-            (program.to_string(), args.to_vec())
+            let mut argv = vec![
+                "-p".to_string(),
+                seatbelt_profile(&home())?,
+                "--".to_string(),
+                program.to_string(),
+            ];
+            argv.extend(args.iter().cloned());
+            Ok((SEATBELT.to_string(), argv))
         }
         SandboxKind::Bwrap => {
+            let binary = bwrap_path().ok_or_else(|| {
+                io::Error::new(ErrorKind::NotFound, "Bubblewrap disappeared before launch")
+            })?;
             let mut argv = vec![
-                "bwrap".to_string(),
                 "--ro-bind".to_string(),
                 "/".to_string(),
                 "/".to_string(),
@@ -90,7 +99,7 @@ pub fn wrap_command(kind: SandboxKind, program: &str, args: &[String]) -> (Strin
                 let p = home.join(rel);
                 if p.is_dir() {
                     argv.push("--tmpfs".to_string());
-                    argv.push(p.to_string_lossy().into_owned());
+                    argv.push(path_arg(&p)?.to_string());
                 }
             }
             for rel in SENSITIVE_FILES {
@@ -98,34 +107,49 @@ pub fn wrap_command(kind: SandboxKind, program: &str, args: &[String]) -> (Strin
                 if p.is_file() {
                     argv.push("--ro-bind".to_string());
                     argv.push("/dev/null".to_string());
-                    argv.push(p.to_string_lossy().into_owned());
+                    argv.push(path_arg(&p)?.to_string());
                 }
             }
             argv.push("--".to_string());
             argv.push(program.to_string());
             argv.extend(args.iter().cloned());
-            ("bwrap".to_string(), argv[1..].to_vec())
+            Ok((binary.to_string(), argv))
         }
-        SandboxKind::None => (program.to_string(), args.to_vec()),
+        SandboxKind::None => Ok((program.to_string(), args.to_vec())),
     }
 }
 
-fn seatbelt_profile() -> String {
-    let home = home();
+fn path_arg(path: &Path) -> io::Result<&str> {
+    path.to_str()
+        .filter(|path| !path.chars().any(char::is_control))
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "unsupported sandbox path"))
+}
+
+fn seatbelt_path(path: &Path) -> io::Result<String> {
+    Ok(path_arg(path)?.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn seatbelt_profile(home: &Path) -> io::Result<String> {
     let mut sb = String::from("(version 1)\n(allow default)\n");
     for rel in SENSITIVE_DIRS {
         let p = home.join(rel);
         if p.is_dir() {
-            sb.push_str(&format!("(deny file-read* (subpath \"{}\"))\n", p.display()));
+            sb.push_str(&format!(
+                "(deny file-read* (subpath \"{}\"))\n",
+                seatbelt_path(&p)?
+            ));
         }
     }
     for rel in SENSITIVE_FILES {
         let p = home.join(rel);
         if p.is_file() {
-            sb.push_str(&format!("(deny file-read* (literal \"{}\"))\n", p.display()));
+            sb.push_str(&format!(
+                "(deny file-read* (literal \"{}\"))\n",
+                seatbelt_path(&p)?
+            ));
         }
     }
-    sb
+    Ok(sb)
 }
 
 /// Spawn `program args` with the proxy environment injected, inside the
@@ -139,7 +163,7 @@ pub fn run_wrapped(
 ) -> std::io::Result<i32> {
     let proxy_url = format!("http://127.0.0.1:{}", proxy_port);
     let no_proxy = "localhost,127.0.0.1,::1";
-    let (bin, argv) = wrap_command(kind, program, args);
+    let (bin, argv) = wrap_command(kind, program, args)?;
     let mut cmd = Command::new(&bin);
     cmd.args(&argv);
     // Proxy env: both cases, since tools read either.
@@ -160,15 +184,32 @@ pub fn run_wrapped(
     }
     cmd.env("AGENTMETRY_GUARD", "1");
     cmd.env("AGENTMETRY_GUARD_PROXY_PORT", proxy_port.to_string());
+    eprintln!(
+        "agentmetry-guard: requested launch mode: {}",
+        kind_name(kind)
+    );
     let status = cmd.status()?;
     Ok(status.code().unwrap_or(-1))
 }
 
-/// Used by `wrap` to report which sandbox ran, for the trail.
-pub fn kind_name(kind: SandboxKind) -> &'static str {
+fn kind_name(kind: SandboxKind) -> &'static str {
     match kind {
         SandboxKind::Seatbelt => "seatbelt",
         SandboxKind::Bwrap => "bwrap",
         SandboxKind::None => "env-only",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seatbelt_quotes_quoted_paths_without_changing_the_rule_shape() {
+        assert_eq!(
+            seatbelt_path(Path::new("/synthetic/home\"with\\quotes")).unwrap(),
+            "/synthetic/home\\\"with\\\\quotes",
+        );
+        assert!(seatbelt_path(Path::new("/synthetic/home\nnewline")).is_err());
     }
 }

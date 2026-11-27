@@ -41,12 +41,29 @@ struct Options {
     allow: Option<Vec<String>>,
 }
 
-fn parse_list(value: &str) -> Vec<String> {
-    value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+fn parse_list(value: &str) -> Result<Vec<String>, String> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(|item| {
+            let host = item.trim();
+            if fileconf::valid_host(host) {
+                Ok(host.to_string())
+            } else {
+                Err("invalid host in a guard allow or deny list".to_string())
+            }
+        })
+        .collect()
 }
 
 fn parse_opts(args: &[String]) -> Result<Options, String> {
-    let mut opts = Options { events_file: None, deny: None, allow: None };
+    let mut opts = Options {
+        events_file: None,
+        deny: None,
+        allow: None,
+    };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -58,53 +75,61 @@ fn parse_opts(args: &[String]) -> Result<Options, String> {
             }
             "--deny" => {
                 i += 1;
-                opts.deny = Some(parse_list(args.get(i).ok_or("--deny needs a comma-separated list")?));
+                opts.deny = Some(parse_list(
+                    args.get(i).ok_or("--deny needs a comma-separated list")?,
+                )?);
             }
             "--allow" => {
                 i += 1;
-                opts.allow = Some(parse_list(args.get(i).ok_or("--allow needs a comma-separated list")?));
+                opts.allow = Some(parse_list(
+                    args.get(i).ok_or("--allow needs a comma-separated list")?,
+                )?);
             }
-            other => return Err(format!("unknown option: {}", other)),
+            _ => return Err("unknown guard option".to_string()),
         }
         i += 1;
     }
     Ok(opts)
 }
 
-/// Resolve the host policy: CLI flag wins, then env, then guard.json.
-fn resolve_policy(opts: &Options, cfg: &config::Config) -> Policy {
-    let file = std::fs::read_to_string(config::guard_config_path(&cfg.data_dir))
-        .ok()
-        .and_then(|text| fileconf::parse(&text).ok())
-        .unwrap_or_default();
-    let env_list = |name: &str| {
-        let raw = std::env::var(name).unwrap_or_default();
-        let trimmed = raw.trim();
-        if trimmed.is_empty() { None } else { Some(parse_list(trimmed)) }
-    };
-    Policy {
-        deny: opts.deny.clone().or_else(|| env_list("AGENTMETRY_GUARD_DENY")).unwrap_or(file.deny),
-        allow: opts.allow.clone().or_else(|| env_list("AGENTMETRY_GUARD_ALLOW")).unwrap_or(file.allow),
+fn resolve_list(
+    cli: Option<Vec<String>>,
+    name: &str,
+    file: Vec<String>,
+) -> Result<Vec<String>, String> {
+    if let Some(cli) = cli {
+        return Ok(cli);
+    }
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => parse_list(&value),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("guard policy list must be UTF-8".to_string())
+        }
+        _ => Ok(file),
     }
 }
 
-fn resolve_events_file(opts: &Options, cfg: &config::Config) -> std::path::PathBuf {
-    if let Some(p) = &opts.events_file {
-        return p.clone();
-    }
-    if let Some(p) = std::env::var_os("AGENTMETRY_GUARD_EVENTS_FILE") {
-        if !p.is_empty() {
-            return std::path::PathBuf::from(p);
-        }
-    }
-    if let Ok(text) = std::fs::read_to_string(config::guard_config_path(&cfg.data_dir)) {
-        if let Ok(fc) = fileconf::parse(&text) {
-            if let Some(p) = fc.events_file {
-                return p;
-            }
-        }
-    }
-    cfg.data_dir.join("guard-events.jsonl")
+/// Load the file once and resolve overrides before starting the proxy or child.
+fn resolve_options(
+    opts: Options,
+    cfg: &config::Config,
+) -> Result<(Policy, std::path::PathBuf), String> {
+    let (path, required) = config::guard_config_path(&cfg.data_dir);
+    let file = fileconf::load(&path, required)?;
+    let policy = Policy {
+        deny: resolve_list(opts.deny, "AGENTMETRY_GUARD_DENY", file.deny)?,
+        allow: resolve_list(opts.allow, "AGENTMETRY_GUARD_ALLOW", file.allow)?,
+    };
+    let events_file = opts
+        .events_file
+        .or_else(|| {
+            std::env::var_os("AGENTMETRY_GUARD_EVENTS_FILE")
+                .filter(|p| !p.is_empty())
+                .map(std::path::PathBuf::from)
+        })
+        .or(file.events_file)
+        .unwrap_or_else(|| cfg.data_dir.join("guard-events.jsonl"));
+    Ok((policy, events_file))
 }
 
 fn main() {
@@ -116,8 +141,8 @@ fn main() {
             print_help();
             0
         }
-        Some(other) => {
-            eprintln!("unknown subcommand: {}", other);
+        Some(_) => {
+            eprintln!("unknown guard subcommand");
             print_help();
             2
         }
@@ -132,7 +157,10 @@ fn print_help() {
     );
 }
 
-fn build_emitter(events_file: std::path::PathBuf, cfg: &config::Config) -> Result<Arc<emit::Emitter>, String> {
+fn build_emitter(
+    events_file: std::path::PathBuf,
+    cfg: &config::Config,
+) -> Result<Arc<emit::Emitter>, String> {
     emit::Emitter::new(cfg_owned(cfg), Some(events_file))
         .map(Arc::new)
         .map_err(|e| format!("cannot open events file: {}", e))
@@ -154,13 +182,17 @@ fn cmd_proxy(args: &[String]) -> i32 {
         Err(e) => return err(&e),
     };
     let cfg = config::load();
-    let emitter = match build_emitter(resolve_events_file(&opts, &cfg), &cfg) {
+    let (policy, events_file) = match resolve_options(opts, &cfg) {
+        Ok(options) => options,
+        Err(e) => return err(&e),
+    };
+    let emitter = match build_emitter(events_file, &cfg) {
         Ok(e) => e,
         Err(e) => return err(&e),
     };
     let corr = cfg.correlation_id.clone();
     let sess = cfg.session_id.clone();
-    match proxy::Proxy::start(emitter, resolve_policy(&opts, &cfg), corr, sess) {
+    match proxy::Proxy::start(emitter, policy, corr, sess) {
         Ok(p) => {
             // The port on stdout is the contract with a supervising process.
             println!("{}", p.port);
@@ -191,20 +223,26 @@ fn cmd_wrap(args: &[String]) -> i32 {
         Err(e) => return err(&e),
     };
     let cfg = config::load();
-    let emitter = match build_emitter(resolve_events_file(&opts, &cfg), &cfg) {
+    let (policy, events_file) = match resolve_options(opts, &cfg) {
+        Ok(options) => options,
+        Err(e) => return err(&e),
+    };
+    let emitter = match build_emitter(events_file, &cfg) {
         Ok(e) => e,
         Err(e) => return err(&e),
     };
     let corr = cfg.correlation_id.clone();
     let sess = cfg.session_id.clone();
-    let mut proxy = match proxy::Proxy::start(Arc::clone(&emitter), resolve_policy(&opts, &cfg), corr, sess) {
+    let mut proxy = match proxy::Proxy::start(Arc::clone(&emitter), policy, corr, sess) {
         Ok(p) => p,
         Err(e) => return err(&format!("cannot bind proxy: {}", e)),
     };
     let kind = sandbox::detect();
-    eprintln!("agentmetry-guard: sandbox mode: {}", sandbox::kind_name(kind));
     let extra_env: Vec<(String, String)> = vec![
-        ("AGENTMETRY_CORRELATION_ID".to_string(), cfg.correlation_id.clone()),
+        (
+            "AGENTMETRY_CORRELATION_ID".to_string(),
+            cfg.correlation_id.clone(),
+        ),
         ("AGENTMETRY_SESSION_ID".to_string(), cfg.session_id.clone()),
     ];
     let code = sandbox::run_wrapped(kind, &cmd[0], &cmd[1..], proxy.port, &extra_env);
@@ -212,7 +250,7 @@ fn cmd_wrap(args: &[String]) -> i32 {
     emitter.drain(std::time::Duration::from_millis(1500));
     match code {
         Ok(c) => c,
-        Err(e) => err(&format!("cannot run {}: {}", cmd[0], e)),
+        Err(e) => err(&format!("cannot start the wrapped command: {}", e)),
     }
 }
 

@@ -1,115 +1,106 @@
 # agentmetry-guard
 
-> **Experimental.** Phase-1 spike: the proxy and `wrap` work and are
-> smoke-tested in CI on Linux, macOS and Windows, but the Seatbelt/Bubblewrap
-> sandbox paths have not been exercised against a live agent session yet, and
-> there are no release binaries. Read [SECURITY.md](SECURITY.md) before relying
-> on it for anything. Reports welcome; see "Reporting a vulnerability" there.
+**Experimental.** Guard records destinations observed by a cooperative local
+HTTP proxy. Its optional OS wrappers hide selected home credential paths.
+Read [SECURITY.md](SECURITY.md) before depending on it.
 
-User-space egress visibility sidecar for [Agentmetry](https://github.com/blitzcrieg1/agentmetry).
-It closes the child-process blind spot: when an AI agent runs a shell tool call
-(`./script.sh`, `python run.py`), child processes can open network connections
-that never pass through the agent's MCP/hook boundary. `agentmetry-guard`
-wraps the command, routes its traffic through a loopback proxy, and records
-every destination as a `network_egress` event in the same Agentmetry trail,
-joined to the tool call by `correlation_id`.
-
-Zero dependencies, pure `std`. The binary runs inside every wrapped command,
-so startup cost (~1 ms) and supply-chain surface are part of the product.
-
-## What it is, and is not
-
-- **Visibility, not containment.** The proxy is cooperative: a client that
-  honours `HTTP_PROXY`/`HTTPS_PROXY` is logged (and optionally blocked by a
-  denylist); one that bypasses it is not seen. DNS queries made without the
-  proxy are invisible, and a `CONNECT` tunnel reveals the host, not the path.
-- **Containment comes from the OS-native user-space sandbox**, not from a
-  kernel extension: on macOS the wrap runs under a generated Seatbelt profile
-  that denies reads to `~/.ssh`, `~/.aws`, `~/.gnupg`, etc.; on Linux under
-  Bubblewrap with a tmpfs (or `/dev/null`) over those paths. On Windows or
-  when neither tool exists, it falls back to proxy env injection only, and
-  says so on stderr (`sandbox mode: env-only`).
-- No root, no sudo, no eBPF, no kernel module.
+Guard is a zero-dependency Rust sidecar for
+[Agentmetry](https://github.com/blitzcrieg1/agentmetry). It adds visibility into
+child-process requests that reach the proxy and can correlate them to an agent
+session with `correlation_id`. Direct sockets and DNS outside the proxy remain
+outside its view. Windows uses proxy environment variables only.
 
 ## Install
 
-Download a binary from [Releases](https://github.com/blitzcrieg1/agentmetry-guard/releases)
-(linux/macOS/Windows, x86_64 and Apple Silicon), or build from source:
+See [Releases](https://github.com/blitzcrieg1/agentmetry-guard/releases) for
+available binaries, or build from source.
 
-```
+```sh
 cargo install --git https://github.com/blitzcrieg1/agentmetry-guard
 ```
 
 ## Usage
 
-```
-agentmetry-guard wrap [--events-file PATH] [--deny host,...] -- <command...>
-agentmetry-guard proxy [--events-file PATH] [--deny host,...]
+```sh
+agentmetry-guard wrap [--events-file PATH] [--deny hosts] [--allow hosts] -- <command...>
+agentmetry-guard proxy [--events-file PATH] [--deny hosts] [--allow hosts]
 ```
 
-`wrap` starts the proxy on an ephemeral `127.0.0.1` port, injects
-`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (and lowercase) plus
-`NO_PROXY=localhost,127.0.0.1,::1` into the child, runs the command inside
-the sandbox wrapper when available, and exits with the child's exit code.
+`proxy` listens on an ephemeral loopback port and prints it on stdout.
+`wrap` sets the child's `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and
+lowercase equivalents. `NO_PROXY` excludes loopback by default. The child
+exit code is returned to the caller.
 
-`proxy` runs standalone and prints the chosen port on stdout.
+The requested launch mode is printed on stderr. On macOS, Guard can use
+Seatbelt through `/usr/bin/sandbox-exec`. On Linux, it can use Bubblewrap
+from a standard system path. If the selected launcher fails, Guard does not
+retry the command outside it. When neither launcher is available, Guard
+reports `env-only`. A mode label describes the requested launcher. Verify
+actual credential isolation separately before relying on it.
+
+Agentmetry can opt into wrapping configured stdio MCP servers with Guard.
+That integration applies to those configured processes. Other tool paths
+still depend on how the application launches them.
 
 ## Events
 
-Every intercepted request becomes one JSONL event, appended to
-`--events-file` (default `<data dir>/guard-events.jsonl`) and POSTed to
-Agentmetry's local ingest when a token is available:
+Guard writes `network_egress` observations with the method, destination host
+and port. It omits URL user information, paths, query strings, headers, and
+bodies from destination evidence. Hostnames are visible, so treat them as
+potentially sensitive operational metadata.
+
+- `success` with `tool.arguments.connection_established: true` records an
+  upstream connection. It does not establish how much data was transferred.
+- `denied` with `connection_established: false` records a proxy policy refusal.
+  `tool.arguments.policy` identifies the denylist or allowlist.
+- `error` with `connection_established: false` records an unsuccessful proxy
+  attempt. It is separate from a policy refusal.
+
+The default local JSONL file is `<data dir>/guard-events.jsonl`.
+With a configured token, Guard can also post to Agentmetry ingest using
+`AGENTMETRY_AUDIT_INGEST_URL` or `AGENTMETRY_URL`.
+`AGENTMETRY_API_KEY` takes precedence over `ingest-token` and `api-token` in
+the data directory. `AGENTMETRY_CORRELATION_ID` and `AGENTMETRY_SESSION_ID`
+carry session attribution supplied by the caller.
+
+On ingest, these observations have `action.type: network_egress` and
+`source.adapter: guard`. They are separate from `tool_called` events.
+
+## Policy
+
+Allow and deny entries are exact hosts or domain suffixes. Matching ignores
+case and a final dot. Use unbracketed IPv6 addresses in policy entries. A
+nonempty allowlist permits only matching destinations. The denylist wins
+when both lists match.
+
+Each list resolves in this order: command-line flag, environment
+(`AGENTMETRY_GUARD_DENY` or `AGENTMETRY_GUARD_ALLOW`), then the policy file.
+`--events-file` and `AGENTMETRY_GUARD_EVENTS_FILE` override the policy path
+for event output.
 
 ```json
-{"source_app":"agentmetry","adapter":"guard","event_type":"network_egress",
- "correlation_id":"<AGENTMETRY_CORRELATION_ID>","session_id":"<AGENTMETRY_SESSION_ID>",
- "timestamp_utc":"...","outcome":"success|denied",
- "tool":{"qualified":"guard.egress","server":"guard",
-         "command":"CONNECT example.com:443",
-         "arguments":{"scheme":"https","method":"CONNECT","host":"example.com","port":443,"path":""}}}
+{"deny": ["blocked.invalid"], "allow": ["api.example.com"], "events_file": "guard-events.jsonl"}
 ```
 
-Configuration is read from the same environment the Agentmetry hook uses:
-`AGENTMETRY_DATA_DIR`, `AGENTMETRY_AUDIT_INGEST_URL` (default
-`http://127.0.0.1:8000`), `AGENTMETRY_API_KEY` or `<data dir>/ingest-token` /
-`api-token`, `AGENTMETRY_CORRELATION_ID`, `AGENTMETRY_SESSION_ID`.
+The default policy is `<data dir>/guard.json`. `AGENTMETRY_GUARD_CONFIG` names
+an explicit policy file. A missing default file is optional. A missing explicit
+file, an unreadable present file, or invalid policy prevents startup. Guard
+checks the file even when the command line supplies both lists. Keep the policy
+and launch settings under operator control if enforcement depends on them.
 
-On ingest these become canonical events with `action.type = network_egress`
-and `source.adapter = "guard"`. They join the agent session by
-`correlation_id` in the trail, the dashboard session view and the SIEM
-forwarders, but they are not `tool_called`, so the tool-sequence detection
-rules do not count them.
+## Verification
 
-## Host policy: denylist and allowlist
+The smoke script uses test endpoints on ephemeral loopback ports and a
+temporary profile. CI and release builds call it to check valid and invalid
+policy startup, successful proxy requests, policy refusals, unestablished
+connections, and destination-only evidence. Its Windows check also exercises
+environment injection and child exit-code propagation. These fixtures
+exercise proxy behavior. OS sandbox protection in a real agent session
+requires separate validation.
 
-`--deny evil.example.com,10.9.9.9` (host or domain suffix, comma-separated,
-case-insensitive, trailing dot normalized) makes the proxy answer `403` to
-matching requests. `--allow api.example.com` switches to allowlist mode: a
-non-empty allowlist blocks every host that does not match it. Blocked
-requests are recorded with `outcome: "denied"` and `policy: "denylist"` or
-`"allowlist"` in `tool.arguments`, so the trail says which list decided.
-
-Precedence per list: CLI flag > environment (`AGENTMETRY_GUARD_DENY` /
-`AGENTMETRY_GUARD_ALLOW`) > the config file.
-
-## Config file
-
-`<data dir>/guard.json` (override with `AGENTMETRY_GUARD_CONFIG`) is the
-managed config, written by fleet tooling:
-
-```json
-{"deny": ["blocked.invalid"], "allow": ["api.example.com"], "events_file": "/var/log/guard-events.jsonl"}
+```sh
+cargo build --offline --locked --release
+bash scripts/smoke.sh ./target/release/agentmetry-guard
 ```
-
-The file is parsed strictly: unknown keys or malformed JSON are rejected, so
-a corrupt file never silently becomes "allow all". `events_file` sets the
-default JSONL path (`--events-file` and `AGENTMETRY_GUARD_EVENTS_FILE` win
-over it).
-
-## Status
-
-Phase 1 spike: loopback proxy, `wrap` with Seatbelt/Bubblewrap fallback,
-JSONL + HTTP ingest emission. Not yet wired into the Python hook layer as an
-automatic wrapper of shell tool calls; that integration is the next step.
 
 License: Apache-2.0.
