@@ -174,11 +174,12 @@ fn bwrap_argv(
         "--proc".to_string(),
         "/proc".to_string(),
     ];
-    // Writable workspace first: with a read-only root any wrapped
-    // server or build fails with EROFS the moment it writes a file
-    // or cache. Sensitive overlays come after, so hiding wins.
+    // Mount the fresh /tmp before putting workspace binds inside it.
+    // Sensitive overlays come last so they also cover writable workspaces.
     if writable.defaults {
-        if let Some(cwd) = cwd {
+        argv.push("--tmpfs".to_string());
+        argv.push("/tmp".to_string());
+        if let Some(cwd) = cwd.filter(|path| *path != Path::new("/tmp")) {
             if cwd.is_dir() {
                 argv.push("--bind".to_string());
                 argv.push(path_arg(cwd)?.to_string());
@@ -190,8 +191,6 @@ fn bwrap_argv(
                 ));
             }
         }
-        argv.push("--tmpfs".to_string());
-        argv.push("/tmp".to_string());
     }
     for path in &writable.paths {
         if under_sensitive(home, path) {
@@ -397,15 +396,32 @@ mod tests {
             cwd_pos < ssh_pos,
             "writable bind must precede the sensitive overlay"
         );
-        // /tmp is writable by default.
+        // /tmp must be mounted first or it shadows a workspace beneath it.
         let tmp_pos = argv.iter().position(|a| a == "/tmp").unwrap();
         assert_eq!(argv[tmp_pos - 1], "--tmpfs");
+        assert!(tmp_pos < cwd_pos);
         // The command itself is last, after `--`.
         assert_eq!(argv.last().unwrap(), "--stdio");
         assert!(argv.contains(&"--".to_string()));
 
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn bwrap_keeps_the_tmp_root_private_when_it_is_the_current_directory() {
+        let home = scratch("tmp-root-home");
+        let (argv, _) = bwrap_argv(
+            &home,
+            Some(Path::new("/tmp")),
+            &Writable::default(),
+            "server",
+            &[],
+        )
+        .unwrap();
+        assert!(argv.windows(2).any(|args| args == ["--tmpfs", "/tmp"]));
+        assert!(!argv.windows(2).any(|args| args == ["--bind", "/tmp"]));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
