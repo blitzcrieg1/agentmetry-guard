@@ -61,7 +61,11 @@ With a configured token, Guard can also post to Agentmetry ingest using
 `AGENTMETRY_AUDIT_INGEST_URL` or `AGENTMETRY_URL`.
 `AGENTMETRY_API_KEY` takes precedence over `ingest-token` and `api-token` in
 the data directory. `AGENTMETRY_CORRELATION_ID` and `AGENTMETRY_SESSION_ID`
-carry session attribution supplied by the caller.
+carry session attribution supplied by the caller. Ingest hostnames resolve
+(`http://localhost:8000` works, not just IP literals), the POST runs on a
+background worker with a bounded queue so a stalled recorder never delays a
+tunnel, and undelivered posts are retried twice before they stay file-only.
+The JSONL file is the authority.
 
 On ingest, these observations have `action.type: network_egress` and
 `source.adapter: guard`. They are separate from `tool_called` events.
@@ -79,7 +83,7 @@ Each list resolves in this order: command-line flag, environment
 for event output.
 
 ```json
-{"deny": ["blocked.invalid"], "allow": ["api.example.com"], "events_file": "guard-events.jsonl"}
+{"deny": ["blocked.invalid"], "allow": ["api.example.com"], "events_file": "guard-events.jsonl", "ssrf_guard": "metadata", "writable_paths": ["~/.cache"], "writable_defaults": true}
 ```
 
 The default policy is `<data dir>/guard.json`. `AGENTMETRY_GUARD_CONFIG` names
@@ -87,6 +91,41 @@ an explicit policy file. A missing default file is optional. A missing explicit
 file, an unreadable present file, or invalid policy prevents startup. Guard
 checks the file even when the command line supplies both lists. Keep the policy
 and launch settings under operator control if enforcement depends on them.
+
+### Egress guardrails
+
+The lists above match the destination name the client asked for. After DNS
+resolution, Guard also checks the address it is about to dial, so alternate
+IP encodings and DNS rebinding cannot reach an endpoint the lists never
+named. `ssrf_guard` (or `AGENTMETRY_GUARD_SSRF`) selects the mode:
+
+- `metadata` (default): refuse link-local destinations, which is where cloud
+  metadata services live (AWS/GCP/Azure IMDS at 169.254.169.254, ECS at
+  169.254.170.2), plus the AWS IPv6 IMDS endpoint.
+- `strict`: also refuse loopback, RFC1918 private ranges, IPv6 ULA and the
+  unspecified address. This also blocks a wrapped child from reaching the
+  recorder's own ingest port through the proxy.
+- `off`: no address checks; the lists are the whole policy.
+
+Denials under a guardrail are `denied` with `tool.arguments.policy:
+"ssrf-guard"`, and a guardrail cannot be voted away by allowlisting a name.
+Loopback and private ranges stay reachable in the default mode because local
+tools (a local LLM, an internal API) legitimately use them, and `NO_PROXY`
+already sends localhost traffic direct, around the proxy. A client that
+ignores the proxy environment bypasses all of this; network isolation is the
+wrapper's job, not the proxy's.
+
+### Writable workspace (Linux Bubblewrap)
+
+The Bubblewrap wrapper binds the host root read-only, which makes every
+wrapped server or build fail with EROFS the moment it writes a file or cache.
+By default (`writable_defaults: true`) Guard binds the current directory
+writable and mounts a fresh `/tmp`. `writable_paths` lists extra writable
+paths, with `~` expanded against the home directory. Credential directories
+are overlaid after the writable binds, so hiding always wins: a writable path
+inside a hidden credential directory is skipped with a warning instead of
+silently re-exposing it. Paths that do not exist are skipped with a warning;
+set `writable_defaults: false` to keep the root fully read-only.
 
 ## Verification
 

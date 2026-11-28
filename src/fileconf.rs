@@ -1,9 +1,12 @@
 //! `<data dir>/guard.json` — the managed config file. Precedence is CLI flag
 //! over environment over file, per list. Strictly parsed: this file is written
 //! by fleet tooling, not typed by hand, so anything but a flat object of
-//! string arrays (and one optional string) is rejected rather than guessed at.
+//! string arrays, booleans and a few optional strings is rejected rather than
+//! guessed at.
 //!
-//! Shape: `{"deny": ["evil.example.com"], "allow": ["api.example.com"], "events_file": "/path"}`
+//! Shape: `{"deny": ["evil.example.com"], "allow": ["api.example.com"],
+//! "events_file": "/path", "writable_paths": ["~/.cache"],
+//! "writable_defaults": true, "ssrf_guard": "metadata"}`
 
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -17,6 +20,15 @@ pub struct FileConfig {
     pub deny: Vec<String>,
     pub allow: Vec<String>,
     pub events_file: Option<PathBuf>,
+    /// Extra writable bind mounts for the Linux Bubblewrap wrapper. Tilde is
+    /// expanded against the home directory at wrap time.
+    pub writable_paths: Vec<String>,
+    /// Whether the Bubblewrap wrapper keeps its writable-by-default workspace
+    /// (the current directory and `/tmp`). `None` means the default: on.
+    pub writable_defaults: Option<bool>,
+    /// Post-resolution egress guardrail mode: `off`, `metadata` (default) or
+    /// `strict`. `None` means the default: `metadata`.
+    pub ssrf_guard: Option<String>,
 }
 
 pub fn load(path: &Path, required: bool) -> Result<FileConfig, String> {
@@ -104,6 +116,15 @@ pub fn parse(text: &str) -> Result<FileConfig, String> {
                     );
                 }
                 cfg.events_file = Some(PathBuf::from(v));
+            }
+            "writable_paths" => cfg.writable_paths = p.path_array()?,
+            "writable_defaults" => cfg.writable_defaults = Some(p.boolean()?),
+            "ssrf_guard" => {
+                let v = p.string()?;
+                if !matches!(v.as_str(), "off" | "metadata" | "strict") {
+                    return Err("ssrf_guard must be off, metadata or strict".to_string());
+                }
+                cfg.ssrf_guard = Some(v);
             }
             _ => return Err("unknown key".to_string()),
         }
@@ -245,6 +266,52 @@ impl Parser {
             }
         }
     }
+    /// Filesystem paths, not hosts: no hostname shape to check, only that the
+    /// entry could name a path. Existence is checked at wrap time, not here.
+    fn path_array(&mut self) -> Result<Vec<String>, String> {
+        self.expect('[')?;
+        let mut out = Vec::new();
+        self.ws();
+        if self.peek() == Some(']') {
+            self.pos += 1;
+            return Ok(out);
+        }
+        loop {
+            self.ws();
+            let path = self.string()?;
+            if path.trim().is_empty() || path.chars().any(char::is_control) {
+                return Err(
+                    "writable_paths entries must be nonempty paths without control characters"
+                        .to_string(),
+                );
+            }
+            out.push(path);
+            self.ws();
+            match self.peek() {
+                Some(',') => {
+                    self.pos += 1;
+                }
+                Some(']') => {
+                    self.pos += 1;
+                    return Ok(out);
+                }
+                _ => return Err("expected ',' or ']' in array".to_string()),
+            }
+        }
+    }
+    fn boolean(&mut self) -> Result<bool, String> {
+        match self.peek() {
+            Some('t') if self.chars[self.pos..].starts_with(&['t', 'r', 'u', 'e']) => {
+                self.pos += 4;
+                Ok(true)
+            }
+            Some('f') if self.chars[self.pos..].starts_with(&['f', 'a', 'l', 's', 'e']) => {
+                self.pos += 5;
+                Ok(false)
+            }
+            _ => Err("expected true or false".to_string()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -287,5 +354,35 @@ mod tests {
             Err("unknown key".to_string())
         );
         assert!(parse(r#"{"events_file":"scratch-\uD83D\uDE80.jsonl"}"#).is_ok());
+    }
+
+    #[test]
+    fn parses_writable_and_ssrf_keys() {
+        let cfg = parse(
+            r#"{"writable_paths": ["~/.cache", "/srv/work"], "writable_defaults": false, "ssrf_guard": "strict"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.writable_paths, vec!["~/.cache", "/srv/work"]);
+        assert_eq!(cfg.writable_defaults, Some(false));
+        assert_eq!(cfg.ssrf_guard.as_deref(), Some("strict"));
+        // Absent keys keep their defaults: workspace writable, metadata guard.
+        let bare = parse("{}").unwrap();
+        assert!(bare.writable_paths.is_empty());
+        assert_eq!(bare.writable_defaults, None);
+        assert_eq!(bare.ssrf_guard, None);
+    }
+
+    #[test]
+    fn rejects_bad_writable_and_ssrf_values() {
+        assert!(parse(r#"{"writable_defaults": "yes"}"#).is_err());
+        assert!(parse(r#"{"writable_defaults": 1}"#).is_err());
+        assert!(parse(r#"{"ssrf_guard": "paranoid"}"#).is_err());
+        assert!(parse(r#"{"ssrf_guard": ""}"#).is_err());
+        assert!(parse(r#"{"writable_paths": [""]}"#).is_err());
+        assert!(parse(r#"{"writable_paths": ["/a/b", ""]}"#).is_err());
+        assert!(parse(r#"{"writable_paths": "/a/b"}"#).is_err());
+        // Host validation must not leak into path entries: "~" and spaces are
+        // legal path characters.
+        assert!(parse(r#"{"writable_paths": ["~/My Cache"]}"#).is_ok());
     }
 }
